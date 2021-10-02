@@ -3,29 +3,31 @@
 helpmsg() {
     cat <<EOF
 Usage: $0 [OPTION]... NAME...
-Find locally built Haskell library documentations (the respective index.html's)
-from the cabal store,
+Find locally built Haskell library documentations (the html files)
+from the GHC installation and the cabal store,
 given package names or module names.
 Open in web browser (using xdg-open) or print filenames.
 
-Default details:
-
 NAMEs are package names, unless -m is specified.
 
-For each package name, the most recently built index.html is selected. You can
-still select a particular version number by including it in the package name,
-e.g., acme-dont-1.1
+If package name: the newest version is selected, and its index.html is
+returned. You can still select a particular version number by including it in
+the package name, e.g., acme-dont-1.1.
 
-For each module name, package names with version numbers are identified, then
-each package name is subject to the above.
+If module name: all newest-version packages that have docs for that module are
+selected, and their Module-Name.html's are returned. Current bug in rare cases:
+If the module is in older versions only, this program won't find it.
 
 Options:
-  -h    Print this help message and exit.
-  -p    NAMEs are package names (default).
-  -m    NAMEs are module names. But documentation files reported are still
-        at package level, not module level.
-  -v    ("view") xdg-open documentation files in web browser (default).
-  -l    ("list") Print documentation filenames to stdout.
+  -h          This help message.
+  -g VERSION  Manually specify GHC version.
+              It is OK to specify a partial version number, e.g., 8.8,
+              provided that "ghc-8.8 --numeric-version" works. If it reports
+              8.8.4 for example, then 8.8.4 is used.
+  -p          NAMEs are package names (default).
+  -m          NAMEs are module names.
+  -w          ("view") xdg-open documentation files in web browser (default).
+  -l          ("list") Print documentation filenames to stdout.
 EOF
 }
 
@@ -37,8 +39,11 @@ errmsgabort() {
 names=p    # p for package names, or m for module names
 action=v   # v for view, or l for list
 
-while getopts :hpmvl f; do
+while getopts :g:hpmwl f; do
     case $f in
+        g)
+            gv=$OPTARG
+            ;;
         h)
             helpmsg
             exit 0
@@ -49,7 +54,7 @@ while getopts :hpmvl f; do
         m)
             names=m
             ;;
-        v)
+        w)
             action=v
             ;;
         l)
@@ -63,39 +68,46 @@ shift `expr $OPTIND - 1`
 
 [ $# -gt 0 ] || errmsgabort "$0: need package/module names. Please use -h for usage."
 
-gv=$(ghc --numeric-version)
-g="ghc-$gv"
-db="$HOME/.cabal/store/$g/package.db"
+if [ -z "$gv" ]; then
+   gv=$(ghc --numeric-version)
+else
+   gv=$(ghc-"$gv" --numeric-version)
+   # This is not idempotent. The user may specify 8.8 for example, and we still
+   # need to elaborate that to 8.8.4.
+fi
+ghcpkg="ghc-pkg-$gv"
+db="$HOME/.cabal/store/ghc-$gv/package.db"
 
 # From module name in $1, find package name(s), then call pkg below.
 mod() {
     m="$1"
-    pkgs=$(ghc-pkg --simple-output --global --package-db="$db" find-module "$m")
-    # The output format is space-delimited. Also, never fails, just empty output
-    # if nothing found.
-    # The output is versioned package names, e.g., acme-dont-1.2. To strip
-    # versions, add --names-only.
-    [ -n "$pkgs" ] || { echo "$0: module $m not found." >&2 ; return ; }
-    uniqpkgs=$(for p in $pkgs ; do echo "$p" ; done | sort | uniq)
+    uniqpkgs=$($ghcpkg --simple-output --names-only --global --package-db="$db" \
+               find-module "$m" | tr ' ' '\n' | sort | uniq)
+    # The ghc-pkg output is space-delimited unversioned package names. There can
+    # be duplicates because behind them are multiple versions and builds. Also,
+    # this ghc-pkg command never fails, just empty output if nothing found.
+
+    # And as said in the help message, this simple algorithm doesn't work for
+    # the case when the module is in older versions only.
+    [ -n "$uniqpkgs" ] || { echo "$0: module $m not found." >&2 ; return ; }
     for p in $uniqpkgs ; do
-        pkg $p
+        pkg $p "$1"
     done
 }
 
-# From package name in $1, find index.html, then either open in browser or print
-# to stdout.
+# From package name in $1, find index.html (if $2 is empty) or <module-name>.html
+# (if $2 is non-empty, it is supposed to be a module name).  Then either open in
+# browser or print to stdout (based on $action).
 pkg() {
     p="$1"
-    # To split ghc-pkg newline-delimited output, change IFS for a little while.
-    oldIFS="$IFS"
-    IFS='
-'
-    htmls=$(ghc-pkg --simple-output --global --package-db="$db" field "$p" haddock-html | sed 's/$/\/index.html/')
-    [ -n "$htmls" ] || return
-    html=$(ls -t $htmls 2> /dev/null | head -1)
-    IFS="$oldIFS"
-    if [ -z "$html" ]; then
-        echo "$0: can't find index.html for $p" >&2
+    htmldir=$($ghcpkg --simple-output --global --package-db="$db" field "$p" haddock-html | tail -1)
+    if [ -z "$2" ]; then
+        html="${htmldir}"/index.html
+    else
+        html="${htmldir}"/$(echo "$2" | sed 's/\./-/g').html
+    fi
+    if [ -z "$htmldir" -o ! -f "$html" ]; then
+        echo "$0: can't find doc for $p" >&2
     else
         if [ $action = v ]; then
             xdg-open "$html"
